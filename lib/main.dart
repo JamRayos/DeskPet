@@ -1,99 +1,149 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math';
 import 'package:flutter/material.dart';
-import 'package:flutter/scheduler.dart';
-import 'serial_pet.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'ble_pet.dart';
+import 'pet.dart'; // colors, rnd, Mood, pet, PetPanel (your existing PET + EYES code)
 
-const cream = Color(0xFFFAF7F2), sage = Color(0xFFA6C1AB), butter = Color(0xFFF7DE9C);
-const ink = Color(0xFF2B2D42), cyan = Color(0xFF00E5FF);
-final rnd = Random();
+// ───────────────────────── MODELS ─────────────────────────
+typedef J = Map<String, dynamic>;
+List<T> _list<T>(dynamic x, T Function(J) f) =>
+    ((x ?? []) as List).map((e) => f(Map<String, dynamic>.from(e))).toList();
 
-// ───────────────────────── PET ─────────────────────────
-enum Mood { idle, focused, happy, excited, curious, startled, sad, annoyed, sleepy, sleeping, relaxed }
-
-class Look {
-  final double w, h, r, dx, dy, tired, angry, happy;
-  const Look(this.w, this.h, {this.r = 12, this.dx = 0, this.dy = 0, this.tired = 0, this.angry = 0, this.happy = 0});
-  static Look lerp(Look a, Look b, double t) {
-    double l(double x, double y) => x + (y - x) * t;
-    return Look(l(a.w, b.w), l(a.h, b.h), r: l(a.r, b.r), dx: l(a.dx, b.dx), dy: l(a.dy, b.dy),
-        tired: l(a.tired, b.tired), angry: l(a.angry, b.angry), happy: l(a.happy, b.happy));
-  }
+class Task {
+  String title; bool done;
+  Task(this.title, [this.done = false]);
+  J toJson() => {'t': title, 'd': done};
+  factory Task.fromJson(J j) => Task(j['t'], j['d'] ?? false);
 }
 
-const looks = {
-  Mood.idle: Look(55, 65),
-  Mood.focused: Look(58, 48, angry: .25),
-  Mood.happy: Look(55, 62, happy: .4),
-  Mood.excited: Look(62, 72, happy: .45),
-  Mood.curious: Look(60, 72),
-  Mood.startled: Look(68, 84, r: 18, dy: -14),
-  Mood.sad: Look(55, 56, tired: .6, dy: 8),
-  Mood.annoyed: Look(58, 50, angry: .6),
-  Mood.sleepy: Look(55, 36, tired: .5, dy: 10),
-  Mood.sleeping: Look(55, 4, r: 2, dy: 12),
-  Mood.relaxed: Look(55, 42, happy: .55, dy: 4),
-};
-
-class Pet extends ChangeNotifier {
-  Mood base = Mood.idle, mood = Mood.idle;
-  String say = "Let's study together!";
-  final log = <String>[];
-  Timer? _t;
-
-  void setBase(Mood m) {
-    base = m;
-    if (_t == null || !_t!.isActive) _apply(m, null);
-  }
-
-  void react(Mood m, String s, {int ms = 2500}) {
-    _t?.cancel();
-    _apply(m, s);
-    _t = Timer(Duration(milliseconds: ms), () => _apply(base, null));
-  }
-
-  void _apply(Mood m, String? s) {
-  mood = m;
-
-  if (s != null) say = s;
-
-  log.insert(0, 'MOOD:${m.name.toUpperCase()}');
-  if (log.length > 6) log.removeLast();
-
-  // Send the same mood to the physical desk pet.
-  serialPet.sendMood(m.name);
-
-  notifyListeners();
-}
+class Flash {
+  String q, a; int miss;
+  Flash(this.q, this.a, [this.miss = 0]);
+  J toJson() => {'q': q, 'a': a, 'm': miss};
+  factory Flash.fromJson(J j) => Flash(j['q'], j['a'], j['m'] ?? 0);
 }
 
-final pet = Pet();
+class Deck {
+  String name; List<Flash> cards;
+  Deck(this.name, [List<Flash>? c]) : cards = c ?? [];
+  J toJson() => {'n': name, 'c': cards.map((e) => e.toJson()).toList()};
+  factory Deck.fromJson(J j) => Deck(j['n'], _list(j['c'], Flash.fromJson));
+}
 
-// ───────────────────────── DATA ─────────────────────────
-class Task { String title; bool done = false; Task(this.title); }
-class Flash { String q, a; int miss = 0; Flash(this.q, this.a); }
-class Entry { String mood, text; Entry(this.mood, this.text); }
+class Entry {
+  String mood, text, date;
+  Entry(this.mood, this.text, this.date);
+  J toJson() => {'m': mood, 't': text, 'd': date};
+  factory Entry.fromJson(J j) => Entry(j['m'], j['t'], j['d'] ?? '');
+}
 
+class Preset {
+  String name; int focus, brk;
+  Preset(this.name, this.focus, this.brk);
+  J toJson() => {'n': name, 'f': focus, 'b': brk};
+  factory Preset.fromJson(J j) => Preset(j['n'], j['f'], j['b']);
+}
+
+// ───────────────────────── STORE (saved to device) ─────────────────────────
 class Store extends ChangeNotifier {
-  final tasks = [Task('Solve 5 calculus problems'), Task('Write Shakespeare essay outline')];
-  final cards = [Flash('Derivative of x²?', '2x'), Flash('Powerhouse of the cell?', 'mitochondria'), Flash('Capital of the Philippines?', 'manila')];
-  final entries = <Entry>[];
-  final focusMin = <double>[40, 55, 30, 70, 45, 20, 10]; // Mon..Sun
-  int sessions = 28, streak = 7, right = 0, wrong = 0, kp = 342, run = 0;
-  void changed() => notifyListeners();
+  List<Task> tasks = [];
+  List<Deck> decks = [];
+  List<Entry> entries = [];
+  List<Preset> presets = [];
+  Map<String, double> focus = {}; 
+  int sessions = 0, right = 0, wrong = 0, kp = 0, run = 0, presetIdx = 0, deckIdx = 0;
+  Timer? _debounce;
+
+  Deck get deck => decks[deckIdx];
+  Preset get preset => presets[presetIdx];
+
+  static String key(DateTime d) =>
+      '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+
+  int get streak {
+    var d = DateTime.now();
+    if ((focus[key(d)] ?? 0) == 0) d = d.subtract(const Duration(days: 1));
+    var n = 0;
+    while ((focus[key(d)] ?? 0) > 0) { n++; d = d.subtract(const Duration(days: 1)); }
+    return n;
+  }
+
+  Future<void> load() async {
+    final p = await SharedPreferences.getInstance();
+    final raw = p.getString('data');
+    if (raw != null) {
+      try {
+        final j = jsonDecode(raw) as J;
+        tasks = _list(j['tasks'], Task.fromJson);
+        decks = _list(j['decks'], Deck.fromJson);
+        entries = _list(j['entries'], Entry.fromJson);
+        presets = _list(j['presets'], Preset.fromJson);
+        focus = Map<String, double>.from((j['focus'] ?? {}).map((k, v) => MapEntry(k, (v as num).toDouble())));
+        sessions = j['sessions'] ?? 0; right = j['right'] ?? 0; wrong = j['wrong'] ?? 0;
+        kp = j['kp'] ?? 0; presetIdx = j['presetIdx'] ?? 0; deckIdx = j['deckIdx'] ?? 0;
+      } catch (_) {}
+    } else {
+      tasks = [Task('Solve 5 calculus problems'), Task('Write Shakespeare essay outline')];
+    }
+    if (presets.isEmpty) presets = [Preset('Classic', 25, 5), Preset('Short', 15, 3), Preset('Deep work', 50, 10)];
+    if (decks.isEmpty) {
+      decks = [Deck('General', [Flash('Derivative of x²?', '2x'), Flash('Powerhouse of the cell?', 'mitochondria'), Flash('Capital of the Philippines?', 'manila')])];
+    }
+    presetIdx = presetIdx.clamp(0, presets.length - 1);
+    deckIdx = deckIdx.clamp(0, decks.length - 1);
+  }
+
+  Future<void> save() async {
+    final p = await SharedPreferences.getInstance();
+    await p.setString('data', jsonEncode({
+      'tasks': tasks.map((e) => e.toJson()).toList(),
+      'decks': decks.map((e) => e.toJson()).toList(),
+      'entries': entries.map((e) => e.toJson()).toList(),
+      'presets': presets.map((e) => e.toJson()).toList(),
+      'focus': focus, 'sessions': sessions, 'right': right, 'wrong': wrong,
+      'kp': kp, 'presetIdx': presetIdx, 'deckIdx': deckIdx,
+    }));
+  }
+
+  /// Call after every change: updates the UI and saves (debounced).
+  void changed() {
+    notifyListeners();
+    _debounce?.cancel();
+    _debounce = Timer(const Duration(milliseconds: 400), save);
+  }
 }
 
 final store = Store();
 
+// ───────────────────────── POMODORO ─────────────────────────
 class Pomo extends ChangeNotifier {
   bool focus = true, running = false, fast = false, half = false;
-  int left = 1500, total = 1500, _tick = 0;
+  int left = 1500, total = 1500, _since = 0;
+  DateTime? _last;
   Timer? _t;
+
+  void reset() {
+    _t?.cancel();
+    if (running) pet.setBase(Mood.idle);
+    running = false; focus = true; half = false;
+    left = total = store.preset.focus * 60;
+    notifyListeners();
+  }
+
+  void selectPreset(int i) {
+    store.presetIdx = i;
+    store.changed();
+    reset();
+  }
 
   void toggle() => running ? pause() : start();
 
   void start() {
     running = true;
+    _last = DateTime.now();
     pet.setBase(focus ? Mood.focused : Mood.relaxed);
     pet.react(Mood.happy, focus ? "Let's focus together!" : 'Break time. Stretch!', ms: 3000);
     _t = Timer.periodic(const Duration(seconds: 1), (_) => _step());
@@ -108,14 +158,19 @@ class Pomo extends ChangeNotifier {
     notifyListeners();
   }
 
+  // Uses the wall clock, so the timer catches up if Android throttles it.
   void _step() {
-    left -= fast ? 60 : 1;
-    _tick++;
+    final secs = DateTime.now().difference(_last!).inSeconds;
+    if (secs < 1) return;
+    _last = _last!.add(Duration(seconds: secs));
+    left -= secs * (fast ? 60 : 1);
+    _since += secs;
     if (left <= 0) return _done();
     if (focus && !half && left * 2 <= total) {
       half = true;
       pet.react(Mood.excited, 'Halfway there! Keep going!');
-    } else if (_tick % (fast ? 4 : 20) == 0) {
+    } else if (_since >= (fast ? 4 : 20)) {
+      _since = 0;
       final m = focus ? [Mood.curious, Mood.happy, Mood.focused] : [Mood.curious, Mood.sleepy, Mood.happy];
       final msg = focus ? ['What are you working on?', "You're doing great!", 'Deep focus mode...'] : ['Nice break!', 'Hydrate!', 'Zzz... so relaxing'];
       final i = rnd.nextInt(3);
@@ -129,16 +184,17 @@ class Pomo extends ChangeNotifier {
     running = false;
     half = false;
     if (focus) {
-      store.focusMin[DateTime.now().weekday - 1] += total / 60;
+      final k = Store.key(DateTime.now());
+      store.focus[k] = (store.focus[k] ?? 0) + total / 60;
       store.sessions++;
       store.kp += 25;
       pet.react(Mood.excited, 'Session complete! +25 KP', ms: 4000);
       focus = false;
-      left = total = 300;
+      left = total = store.preset.brk * 60;
       pet.setBase(Mood.relaxed);
     } else {
       focus = true;
-      left = total = 1500;
+      left = total = store.preset.focus * 60;
       pet.setBase(Mood.focused);
       pet.react(Mood.startled, 'Break over! Back to it!');
     }
@@ -149,139 +205,14 @@ class Pomo extends ChangeNotifier {
 
 final pomo = Pomo();
 
-// ───────────────────────── EYES ─────────────────────────
-class PetView extends StatefulWidget {
-  const PetView({super.key});
-  @override
-  State<PetView> createState() => _PetViewState();
-}
-
-class _PetViewState extends State<PetView> with SingleTickerProviderStateMixin {
-  late final Ticker _tk;
-  Look cur = looks[Mood.idle]!;
-  Duration last = Duration.zero;
-  double t = 0, blinkT = -1, nextBlink = 2, nextGlance = 3, gx = 0, gy = 0, tgx = 0, tgy = 0;
-  Mood _prev = Mood.idle;
-
-  @override
-  void initState() {
-    super.initState();
-    _tk = createTicker(_tick)..start();
-  }
-
-  void _tick(Duration el) {
-    final dt = (el - last).inMicroseconds / 1e6;
-    last = el;
-    t = el.inMicroseconds / 1e6;
-    final m = pet.mood;
-
-    if (m != _prev) {                       // mood just changed
-      _prev = m;
-      if (m == Mood.curious) {              // look to a side now, back to center after ~0.9 s
-        tgx = (rnd.nextBool() ? 1 : -1) * 18;
-        tgy = 0;
-        nextGlance = t + .9;
-      }
-    }
-
-    cur = Look.lerp(cur, looks[m]!, 1 - pow(0.001, dt).toDouble()); // smooth tween
-    if (t >= nextBlink && m != Mood.sleeping) {
-      blinkT = t;
-      nextBlink = t + 2 + rnd.nextDouble() * 3;
-    }
-    final calm = m == Mood.idle || m == Mood.focused || m == Mood.curious || m == Mood.relaxed;
-    if (!calm) {
-      tgx = 0; tgy = 0;
-    } else if (t >= nextGlance) {
-      if (tgx != 0 || tgy != 0) {
-        tgx = 0; tgy = 0;
-        nextGlance = t + 3 + rnd.nextDouble() * 5;      // mostly centered
-      } else if (m == Mood.curious || rnd.nextInt(3) == 0) {
-        tgx = (rnd.nextBool() ? 1 : -1) * 18;
-        tgy = rnd.nextBool() ? -10 : 0;
-        nextGlance = t + .9 + rnd.nextDouble();
-      } else {
-        nextGlance = t + 2;
-      }
-    }
-    gx += (tgx - gx) * .12;
-    gy += (tgy - gy) * .12;
-    setState(() {});
-  }
-
-  @override
-  void dispose() {
-    _tk.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final m = pet.mood;
-    final blink = (blinkT >= 0 && t - blinkT < .18) ? sin(pi * (t - blinkT) / .18) : 0.0;
-    final bounce = m == Mood.excited ? sin(t * 16) * 5 : 0.0;
-    final shake = m == Mood.annoyed ? sin(t * 45) * 2.5 : 0.0;
-    return CustomPaint(painter: _EyePainter(cur, gx + shake, gy + bounce, blink), size: Size.infinite);
-  }
-}
-
-class _EyePainter extends CustomPainter {
-  final Look l;
-  final double dx, dy, blink;
-  _EyePainter(this.l, this.dx, this.dy, this.blink);
-
-  @override
-  void paint(Canvas c, Size s) {
-    final k = s.height / 150;
-    final h = (l.h * (1 - blink) + 3 * blink) * k, w = l.w * k, gap = 20 * k;
-    final cx = s.width / 2 + dx * k, cy = s.height / 2 + (l.dy + dy) * k;
-    final p = Paint()..color = cyan, bg = Paint()..color = Colors.black;
-    for (var i = 0; i < 2; i++) {
-      final x = cx - gap / 2 - w + i * (w + gap), y = cy - h / 2, left = i == 0;
-      final rr = RRect.fromRectAndRadius(Rect.fromLTWH(x, y, w, h), Radius.circular(min(l.r * k, h / 2)));
-      c.save();
-      c.clipRRect(rr);
-      c.drawRRect(rr, p);
-      if (l.tired > 0) c.drawPath(Path()..moveTo(x, y)..lineTo(x + w, y)..lineTo(left ? x : x + w, y + l.tired * h)..close(), bg);
-      if (l.angry > 0) c.drawPath(Path()..moveTo(x, y)..lineTo(x + w, y)..lineTo(left ? x + w : x, y + l.angry * h)..close(), bg);
-      if (l.happy > 0) c.drawRRect(RRect.fromLTRBR(x - 4, y + h * (1 - l.happy), x + w + 4, y + h + 40, Radius.circular(w / 2)), bg);
-      c.restore();
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant CustomPainter old) => true;
-}
-
-class PetPanel extends StatelessWidget {
-  const PetPanel({super.key});
-  @override
-  Widget build(BuildContext context) => ListenableBuilder(
-        listenable: pet,
-        builder: (_, __) => Container(
-          margin: const EdgeInsets.fromLTRB(16, 8, 16, 4),
-          decoration: BoxDecoration(color: Colors.black, borderRadius: BorderRadius.circular(28), border: Border.all(color: sage, width: 4)),
-          child: Column(children: [
-            const SizedBox(height: 150, width: double.infinity, child: PetView()),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
-              child: Row(children: [
-                Expanded(child: Text(pet.say, style: const TextStyle(color: butter, fontWeight: FontWeight.w600))),
-                ValueListenableBuilder<bool>(
-                  valueListenable: serialPet.connected,
-                  builder: (_, on, __) => Text('${on ? "● USB" : "○ not connected"}  → ${pet.log.first}',
-                                                 style: TextStyle(color: on ? cyan : Colors.redAccent, fontFamily: 'monospace', fontSize: 11),
-  ),
-),
-              ]),
-            ),
-          ]),
-        ),
-      );
-}
-
 // ───────────────────────── APP ─────────────────────────
-void main() => runApp(const DeskPetApp());
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await store.load();
+  pomo.reset();
+  runApp(const DeskPetApp());
+  blePet.init(); // auto-reconnects to the saved pet
+}
 
 class DeskPetApp extends StatelessWidget {
   const DeskPetApp({super.key});
@@ -313,9 +244,7 @@ class _ShellState extends State<Shell> {
         body: SafeArea(
           child: Column(children: [
             const PetPanel(),
-            Expanded(
-              child: IndexedStack(index: i, children: const [TimerPage(), TasksPage(), CardsPage(), ReviewPage(), StatsPage()]),
-            ),
+            Expanded(child: IndexedStack(index: i, children: const [TimerPage(), TasksPage(), CardsPage(), ReviewPage(), StatsPage()])),
           ]),
         ),
         bottomNavigationBar: NavigationBar(
@@ -341,244 +270,190 @@ InputDecoration field(String hint) => InputDecoration(
     border: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: BorderSide.none));
 String mmss(int s) => '${(s ~/ 60).toString().padLeft(2, '0')}:${(s % 60).toString().padLeft(2, '0')}';
 
+Future<String?> askText(BuildContext c, String title, {String initial = '', int lines = 1}) {
+  final t = TextEditingController(text: initial);
+  return showDialog<String>(
+    context: c,
+    builder: (d) => AlertDialog(
+      title: Text(title),
+      content: TextField(controller: t, autofocus: true, maxLines: lines),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(d), child: const Text('Cancel')),
+        FilledButton(onPressed: () => Navigator.pop(d, t.text.trim()), child: const Text('OK')),
+      ],
+    ),
+  );
+}
 
 // ── Timer ──
+void presetDialog(BuildContext ctx, {int? idx}) {
+  final p = idx == null ? null : store.presets[idx];
+  final n = TextEditingController(text: p?.name ?? '');
+  final f = TextEditingController(text: '${p?.focus ?? 25}');
+  final b = TextEditingController(text: '${p?.brk ?? 5}');
+  showDialog(
+    context: ctx,
+    builder: (d) => AlertDialog(
+      title: Text(p == null ? 'New timer' : 'Edit timer'),
+      content: Column(mainAxisSize: MainAxisSize.min, children: [
+        TextField(controller: n, decoration: const InputDecoration(labelText: 'Name')),
+        TextField(controller: f, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Focus (minutes)')),
+        TextField(controller: b, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Break (minutes)')),
+      ]),
+      actions: [
+        if (p != null && store.presets.length > 1)
+          TextButton(
+            onPressed: () {
+              store.presets.removeAt(idx!);
+              store.presetIdx = 0;
+              store.changed();
+              pomo.reset();
+              Navigator.pop(d);
+            },
+            child: const Text('Delete'),
+          ),
+        TextButton(onPressed: () => Navigator.pop(d), child: const Text('Cancel')),
+        FilledButton(
+          onPressed: () {
+            final fm = (int.tryParse(f.text) ?? 25).clamp(1, 180).toInt();
+            final bm = (int.tryParse(b.text) ?? 5).clamp(1, 60).toInt();
+            final name = n.text.trim().isEmpty ? '$fm/$bm' : n.text.trim();
+            if (p == null) {
+              store.presets.add(Preset(name, fm, bm));
+              store.presetIdx = store.presets.length - 1;
+            } else {
+              p.name = name; p.focus = fm; p.brk = bm;
+            }
+            store.changed();
+            pomo.reset();
+            Navigator.pop(d);
+          },
+          child: const Text('Save'),
+        ),
+      ],
+    ),
+  );
+}
+
 class TimerPage extends StatelessWidget {
   const TimerPage({super.key});
 
   @override
   Widget build(BuildContext context) => ListenableBuilder(
-        listenable: pomo,
+        listenable: Listenable.merge([pomo, store]),
         builder: (_, __) => ListView(
           padding: const EdgeInsets.all(20),
           children: [
-            Center(
-              child: Text(
-                pomo.focus ? 'Focus Session' : 'Break',
-                style: const TextStyle(
-                  fontSize: 18,
-                  fontWeight: FontWeight.w600,
-                  color: ink,
+            Wrap(spacing: 8, alignment: WrapAlignment.center, children: [
+              for (var k = 0; k < store.presets.length; k++)
+                ChoiceChip(
+                  label: Text('${store.presets[k].name} · ${store.presets[k].focus}/${store.presets[k].brk}'),
+                  selected: store.presetIdx == k,
+                  onSelected: pomo.running ? null : (_) => pomo.selectPreset(k),
                 ),
+              ActionChip(
+                avatar: const Icon(Icons.add, size: 18),
+                label: const Text('Custom'),
+                onPressed: pomo.running ? null : () => presetDialog(context),
+              ),
+            ]),
+            Center(
+              child: TextButton.icon(
+                onPressed: pomo.running ? null : () => presetDialog(context, idx: store.presetIdx),
+                icon: const Icon(Icons.edit, size: 16),
+                label: Text('Edit "${store.preset.name}"'),
               ),
             ),
-
+            Center(child: Text(pomo.focus ? 'Focus Session' : 'Break', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600, color: ink))),
             const SizedBox(height: 16),
-
-            // Existing timer display
             Center(
               child: SizedBox(
-                width: 200,
-                height: 200,
-                child: Stack(
-                  alignment: Alignment.center,
-                  children: [
-                    SizedBox.expand(
-                      child: CircularProgressIndicator(
-                        value: pomo.left / pomo.total,
-                        strokeWidth: 12,
-                        color: pomo.focus ? sage : butter,
-                        backgroundColor: Colors.black12,
-                      ),
+                width: 200, height: 200,
+                child: Stack(alignment: Alignment.center, children: [
+                  SizedBox.expand(
+                    child: CircularProgressIndicator(
+                      value: (pomo.left / pomo.total).clamp(0.0, 1.0),
+                      strokeWidth: 12,
+                      color: pomo.focus ? sage : butter,
+                      backgroundColor: Colors.black12,
                     ),
-                    Text(
-                      mmss(pomo.left),
-                      style: const TextStyle(
-                        fontSize: 44,
-                        fontWeight: FontWeight.bold,
-                        color: ink,
-                      ),
-                    ),
-                  ],
+                  ),
+                  Text(mmss(max(pomo.left, 0)), style: const TextStyle(fontSize: 44, fontWeight: FontWeight.bold, color: ink)),
+                ]),
+              ),
+            ),
+            const SizedBox(height: 20),
+            Row(children: [
+              Expanded(
+                child: FilledButton.icon(
+                  style: FilledButton.styleFrom(backgroundColor: sage, foregroundColor: ink, padding: const EdgeInsets.all(16)),
+                  onPressed: pomo.toggle,
+                  icon: Icon(pomo.running ? Icons.pause : Icons.play_arrow),
+                  label: Text(pomo.running ? 'Pause' : 'Start ${pomo.focus ? "${store.preset.focus}m focus" : "${store.preset.brk}m break"}'),
                 ),
               ),
-            ),
-
-            const SizedBox(height: 20),
-
-            // Existing Start/Pause button
-            FilledButton.icon(
-              style: FilledButton.styleFrom(
-                backgroundColor: sage,
-                foregroundColor: ink,
-                padding: const EdgeInsets.all(16),
-              ),
-              onPressed: pomo.toggle,
-              icon: Icon(
-                pomo.running ? Icons.pause : Icons.play_arrow,
-              ),
-              label: Text(
-                pomo.running
-                    ? 'Pause'
-                    : 'Start ${pomo.focus ? "25m Pomodoro" : "5m Break"}',
-              ),
-            ),
-
-            // Existing Demo Speed switch
+              const SizedBox(width: 8),
+              IconButton.outlined(onPressed: pomo.reset, icon: const Icon(Icons.restart_alt), tooltip: 'Reset'),
+            ]),
             SwitchListTile(
-              title: const Text(
-                'Demo speed (×60) – see all reactions fast',
-              ),
+              title: const Text('Demo speed (×60) – see all reactions fast'),
               value: pomo.fast,
-              onChanged: (v) {
-                pomo.fast = v;
-                pomo.notifyListeners();
-              },
+              onChanged: (v) { pomo.fast = v; pomo.notifyListeners(); },
             ),
-
-            // NEW: Arduino connection section
             const Divider(height: 32),
-
-            const ArduinoConnectionPanel(),
+            const BluetoothPanel(),
           ],
         ),
       );
 }
 
-class ArduinoConnectionPanel extends StatefulWidget {
-  const ArduinoConnectionPanel({super.key});
+// ── Bluetooth ──
+class BluetoothPanel extends StatelessWidget {
+  const BluetoothPanel({super.key});
 
   @override
-  State<ArduinoConnectionPanel> createState() =>
-      _ArduinoConnectionPanelState();
-}
-
-class _ArduinoConnectionPanelState
-    extends State<ArduinoConnectionPanel> {
-  List<String> ports = [];
-  String? selectedPort;
-  bool connected = false;
-  String status = 'Not connected';
-
-  @override
-  void initState() {
-    super.initState();
-    refreshPorts();
-  }
-
-  void refreshPorts() {
-    // Get available serial ports from your serial_pet.dart file.
-    final available = serialPet.availablePorts;
-
-    setState(() {
-      ports = available;
-      if (selectedPort == null ||
-          !ports.contains(selectedPort)) {
-        selectedPort = ports.isNotEmpty ? ports.first : null;
-      }
-    });
-  }
-
-  Future<void> connectArduino() async {
-    if (selectedPort == null) {
-      setState(() => status = 'No COM port found');
-      return;
-    }
-
-    try {
-      await serialPet.connect(selectedPort!);
-
-      await Future.delayed(const Duration(seconds: 2));
-      serialPet.sendMood(pet.mood.name);
-
-      if (!mounted) return;
-
-      setState(() {
-        connected = true;
-        status = 'Connected to $selectedPort';
-      });
-    } catch (e) {
-      if (!mounted) return;
-
-      setState(() {
-        connected = false;
-        status = 'Connection failed: $e';
-      });
-    }
-  }
-
-  Future<void> disconnectArduino() async {
-    await serialPet.disconnect();
-
-    if (!mounted) return;
-
-    setState(() {
-      connected = false;
-      status = 'Not connected';
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              'Arduino Connection',
-              style: TextStyle(
-                fontSize: 18,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-
-            const SizedBox(height: 12),
-
-            DropdownButtonFormField<String>(
-              value: selectedPort,
-              decoration: const InputDecoration(
-                labelText: 'COM Port',
-                border: OutlineInputBorder(),
-              ),
-              hint: const Text('Select Arduino port'),
-              items: ports.map((port) {
-                return DropdownMenuItem(
-                  value: port,
-                  child: Text(port),
-                );
-              }).toList(),
-              onChanged: connected
-                  ? null
-                  : (value) {
-                      setState(() => selectedPort = value);
-                    },
-            ),
-
-            const SizedBox(height: 12),
-
-            Wrap(
-              spacing: 8,
-              children: [
-                OutlinedButton.icon(
-                  onPressed: connected ? null : refreshPorts,
-                  icon: const Icon(Icons.refresh),
-                  label: const Text('Refresh'),
-                ),
-
-                FilledButton.icon(
-                  onPressed: connected
-                      ? disconnectArduino
-                      : connectArduino,
-                  icon: Icon(
-                    connected ? Icons.link_off : Icons.usb,
-                  ),
-                  label: Text(
-                    connected ? 'Disconnect' : 'Connect',
-                  ),
-                ),
-              ],
-            ),
-
+  Widget build(BuildContext context) => Card(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('Desk Pet (Bluetooth)', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
             const SizedBox(height: 8),
-
-            Text('Status: $status'),
-          ],
+            ValueListenableBuilder<String>(valueListenable: blePet.status, builder: (_, s, __) => Text('Status: $s')),
+            const SizedBox(height: 8),
+            ValueListenableBuilder<bool>(
+              valueListenable: blePet.connected,
+              builder: (_, on, __) => on
+                  ? FilledButton.icon(onPressed: blePet.disconnect, icon: const Icon(Icons.bluetooth_disabled), label: const Text('Disconnect & forget'))
+                  : ValueListenableBuilder<bool>(
+                      valueListenable: blePet.scanning,
+                      builder: (_, sc, __) => FilledButton.icon(
+                        onPressed: sc ? null : blePet.scan,
+                        icon: const Icon(Icons.bluetooth_searching),
+                        label: Text(sc ? 'Scanning…' : 'Scan for pet'),
+                      ),
+                    ),
+            ),
+            ValueListenableBuilder<bool>(
+              valueListenable: blePet.connected,
+              builder: (_, on, __) => on
+                  ? const SizedBox.shrink()
+                  : ValueListenableBuilder<List<ScanResult>>(
+                      valueListenable: blePet.results,
+                      builder: (_, list, __) => Column(children: [
+                        for (final r in list)
+                          ListTile(
+                            leading: const Icon(Icons.pets),
+                            title: Text(r.advertisementData.advName.isEmpty ? 'DeskPet' : r.advertisementData.advName),
+                            subtitle: Text(r.device.remoteId.str),
+                            trailing: Text('${r.rssi} dBm'),
+                            onTap: () => blePet.connect(r.device),
+                          ),
+                      ]),
+                    ),
+            ),
+          ]),
         ),
-      ),
-    );
-  }
+      );
 }
 
 // ── Tasks ──
@@ -630,7 +505,109 @@ class _TasksState extends State<TasksPage> {
       );
 }
 
-// ── Flashcards ──
+// ── Flashcards with decks ──
+void cardDialog(BuildContext ctx, {Flash? f}) {
+  final q = TextEditingController(text: f?.q), a = TextEditingController(text: f?.a);
+  showDialog(
+    context: ctx,
+    builder: (d) => AlertDialog(
+      title: Text(f == null ? 'New flashcard' : 'Edit flashcard'),
+      content: Column(mainAxisSize: MainAxisSize.min, children: [
+        TextField(controller: q, decoration: const InputDecoration(labelText: 'Question')),
+        TextField(controller: a, decoration: const InputDecoration(labelText: 'Answer')),
+      ]),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(d), child: const Text('Cancel')),
+        FilledButton(
+          onPressed: () {
+            final qq = q.text.trim(), aa = a.text.trim();
+            if (qq.isNotEmpty && aa.isNotEmpty) {
+              if (f == null) { store.deck.cards.add(Flash(qq, aa)); } else { f.q = qq; f.a = aa; }
+              store.changed();
+            }
+            Navigator.pop(d);
+          },
+          child: const Text('Save'),
+        ),
+      ],
+    ),
+  );
+}
+
+class DeckEditor extends StatelessWidget {
+  const DeckEditor({super.key});
+
+  @override
+  Widget build(BuildContext context) => ListenableBuilder(
+        listenable: store,
+        builder: (ctx, __) {
+          final d = store.deck;
+          return Scaffold(
+            appBar: AppBar(title: Text(d.name), actions: [
+              IconButton(
+                tooltip: 'Rename',
+                icon: const Icon(Icons.drive_file_rename_outline),
+                onPressed: () async {
+                  final n = await askText(ctx, 'Rename deck', initial: d.name);
+                  if (n != null && n.isNotEmpty) { d.name = n; store.changed(); }
+                },
+              ),
+              IconButton(
+                tooltip: 'Bulk add',
+                icon: const Icon(Icons.playlist_add),
+                onPressed: () async {
+                  final t = await askText(ctx, 'One card per line:  question | answer', lines: 8);
+                  if (t == null) return;
+                  for (final line in t.split('\n')) {
+                    final p = line.split('|');
+                    if (p.length >= 2 && p[0].trim().isNotEmpty && p[1].trim().isNotEmpty) {
+                      d.cards.add(Flash(p[0].trim(), p.sublist(1).join('|').trim()));
+                    }
+                  }
+                  store.changed();
+                },
+              ),
+              if (store.decks.length > 1)
+                IconButton(
+                  tooltip: 'Delete deck',
+                  icon: const Icon(Icons.delete_outline),
+                  onPressed: () async {
+                    final yes = await showDialog<bool>(
+                      context: ctx,
+                      builder: (x) => AlertDialog(
+                        title: Text('Delete "${d.name}"?'),
+                        actions: [
+                          TextButton(onPressed: () => Navigator.pop(x, false), child: const Text('Cancel')),
+                          FilledButton(onPressed: () => Navigator.pop(x, true), child: const Text('Delete')),
+                        ],
+                      ),
+                    );
+                    if (yes == true && ctx.mounted) {
+                      Navigator.pop(ctx);
+                      store.decks.remove(d);
+                      store.deckIdx = 0;
+                      store.changed();
+                    }
+                  },
+                ),
+            ]),
+            floatingActionButton: FloatingActionButton(onPressed: () => cardDialog(ctx), child: const Icon(Icons.add)),
+            body: d.cards.isEmpty
+                ? const Center(child: Text('No cards yet. Tap + to add one.'))
+                : ListView(children: [
+                    for (final f in d.cards)
+                      ListTile(
+                        title: Text(f.q),
+                        subtitle: Text(f.a),
+                        onTap: () => cardDialog(ctx, f: f),
+                        trailing: IconButton(icon: const Icon(Icons.delete_outline), onPressed: () { d.cards.remove(f); store.changed(); }),
+                      ),
+                  ]),
+          );
+        },
+      );
+}
+
 class CardsPage extends StatefulWidget {
   const CardsPage({super.key});
   @override
@@ -642,8 +619,10 @@ class _CardsState extends State<CardsPage> {
   bool? ok;
   final ans = TextEditingController();
 
+  void resetStudy() { i = 0; ok = null; ans.clear(); }
+
   void check() {
-    final f = store.cards[i];
+    final f = store.deck.cards[i];
     final good = ans.text.trim().toLowerCase() == f.a.toLowerCase();
     setState(() => ok = good);
     if (good) {
@@ -659,55 +638,61 @@ class _CardsState extends State<CardsPage> {
     store.changed();
   }
 
-  void next() => setState(() { i = (i + 1) % store.cards.length; ok = null; ans.clear(); });
+  void next() => setState(() { i = (i + 1) % store.deck.cards.length; ok = null; ans.clear(); });
 
-  void addCard() {
-    final q = TextEditingController(), a = TextEditingController();
-    showDialog(
-      context: context,
-      builder: (_) => AlertDialog(
-        title: const Text('New flashcard'),
-        content: Column(mainAxisSize: MainAxisSize.min, children: [
-          TextField(controller: q, decoration: const InputDecoration(labelText: 'Question')),
-          TextField(controller: a, decoration: const InputDecoration(labelText: 'Answer')),
-        ]),
-        actions: [
-          TextButton(
-            onPressed: () {
-              if (q.text.isNotEmpty && a.text.isNotEmpty) { store.cards.add(Flash(q.text, a.text)); store.changed(); }
-              Navigator.pop(context);
-            },
-            child: const Text('Add'),
-          ),
-        ],
-      ),
-    );
+  Future<void> newDeck() async {
+    final n = await askText(context, 'New deck name');
+    if (n == null || n.isEmpty) return;
+    store.decks.add(Deck(n));
+    store.deckIdx = store.decks.length - 1;
+    setState(resetStudy);
+    store.changed();
+    if (mounted) Navigator.push(context, MaterialPageRoute(builder: (_) => const DeckEditor()));
   }
 
   @override
-  Widget build(BuildContext context) {
-    final f = store.cards[i];
-    return ListView(padding: const EdgeInsets.all(20), children: [
-      Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-        Text('Card ${i + 1}/${store.cards.length}', style: const TextStyle(color: Colors.black54)),
-        TextButton.icon(onPressed: addCard, icon: const Icon(Icons.add), label: const Text('Add card')),
-      ]),
-      Container(
-        padding: const EdgeInsets.all(24), decoration: box(),
-        child: Text(f.q, textAlign: TextAlign.center, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w600, color: ink)),
-      ),
-      const SizedBox(height: 12),
-      TextField(controller: ans, enabled: ok == null, onSubmitted: (_) => check(), decoration: field('Type your answer')),
-      const SizedBox(height: 12),
-      if (ok == null)
-        FilledButton(style: FilledButton.styleFrom(backgroundColor: sage, foregroundColor: ink), onPressed: check, child: const Text('Check'))
-      else ...[
-        Text(ok! ? '✅ Correct!' : '❌ Answer: ${f.a}', textAlign: TextAlign.center, style: const TextStyle(fontSize: 18)),
-        const SizedBox(height: 8),
-        FilledButton(style: FilledButton.styleFrom(backgroundColor: butter, foregroundColor: ink), onPressed: next, child: const Text('Next card')),
-      ],
-    ]);
-  }
+  Widget build(BuildContext context) => ListenableBuilder(
+        listenable: store,
+        builder: (_, __) {
+          final d = store.deck;
+          if (i >= d.cards.length) i = 0;
+          final f = d.cards.isEmpty ? null : d.cards[i];
+          return ListView(padding: const EdgeInsets.all(20), children: [
+            Row(children: [
+              Expanded(
+                child: DropdownButton<int>(
+                  isExpanded: true,
+                  value: store.deckIdx,
+                  items: [for (var k = 0; k < store.decks.length; k++) DropdownMenuItem(value: k, child: Text('${store.decks[k].name} (${store.decks[k].cards.length})'))],
+                  onChanged: (v) { store.deckIdx = v!; setState(resetStudy); store.changed(); },
+                ),
+              ),
+              IconButton(tooltip: 'New deck', icon: const Icon(Icons.create_new_folder_outlined), onPressed: newDeck),
+              IconButton(tooltip: 'Edit deck', icon: const Icon(Icons.edit_note), onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const DeckEditor()))),
+            ]),
+            if (f == null)
+              const Padding(padding: EdgeInsets.all(24), child: Center(child: Text('This deck is empty. Tap the edit icon to add cards.')))
+            else ...[
+              Text('Card ${i + 1}/${d.cards.length}', style: const TextStyle(color: Colors.black54)),
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.all(24), decoration: box(),
+                child: Text(f.q, textAlign: TextAlign.center, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w600, color: ink)),
+              ),
+              const SizedBox(height: 12),
+              TextField(controller: ans, enabled: ok == null, onSubmitted: (_) => check(), decoration: field('Type your answer')),
+              const SizedBox(height: 12),
+              if (ok == null)
+                FilledButton(style: FilledButton.styleFrom(backgroundColor: sage, foregroundColor: ink), onPressed: check, child: const Text('Check'))
+              else ...[
+                Text(ok! ? '✅ Correct!' : '❌ Answer: ${f.a}', textAlign: TextAlign.center, style: const TextStyle(fontSize: 18)),
+                const SizedBox(height: 8),
+                FilledButton(style: FilledButton.styleFrom(backgroundColor: butter, foregroundColor: ink), onPressed: next, child: const Text('Next card')),
+              ],
+            ],
+          ]);
+        },
+      );
 }
 
 // ── Review ──
@@ -732,7 +717,7 @@ class _ReviewState extends State<ReviewPage> {
   Widget build(BuildContext context) => ListenableBuilder(
         listenable: store,
         builder: (_, __) {
-          final missed = store.cards.where((c) => c.miss > 0).toList();
+          final missed = [for (final d in store.decks) for (final c in d.cards) if (c.miss > 0) MapEntry(d.name, c)];
           return ListView(padding: const EdgeInsets.all(16), children: [
             const Text('How are you feeling after that session?', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600)),
             Wrap(spacing: 8, children: [
@@ -743,13 +728,13 @@ class _ReviewState extends State<ReviewPage> {
                 ),
             ]),
             const SizedBox(height: 8),
-            TextField(controller: note, maxLines: 2, decoration: field('One thing I\'m grateful for today...')),
+            TextField(controller: note, maxLines: 2, decoration: field("One thing I'm grateful for today...")),
             const SizedBox(height: 8),
             FilledButton(
               style: FilledButton.styleFrom(backgroundColor: sage, foregroundColor: ink),
               onPressed: () {
                 if (note.text.isEmpty) return;
-                store.entries.insert(0, Entry(feel, note.text));
+                store.entries.insert(0, Entry(feel, note.text, Store.key(DateTime.now())));
                 note.clear();
                 store.changed();
                 pet.react(Mood.happy, 'Great job studying! Proud of you!');
@@ -759,12 +744,12 @@ class _ReviewState extends State<ReviewPage> {
             const SizedBox(height: 16),
             const Text('Cards to review (missed)', style: TextStyle(fontWeight: FontWeight.w600)),
             if (missed.isEmpty) const Padding(padding: EdgeInsets.all(8), child: Text('Nothing missed yet 🎉')),
-            for (final c in missed)
-              Container(margin: const EdgeInsets.only(top: 8), decoration: box(), child: ListTile(title: Text(c.q), subtitle: Text('Answer: ${c.a}'), trailing: Text('✗ ${c.miss}'))),
+            for (final m in missed)
+              Container(margin: const EdgeInsets.only(top: 8), decoration: box(), child: ListTile(title: Text(m.value.q), subtitle: Text('${m.key} · Answer: ${m.value.a}'), trailing: Text('✗ ${m.value.miss}'))),
             const SizedBox(height: 16),
             const Text('Previous entries', style: TextStyle(fontWeight: FontWeight.w600)),
             for (final e in store.entries)
-              Container(margin: const EdgeInsets.only(top: 8), decoration: box(), child: ListTile(title: Text(e.text), trailing: Text(e.mood))),
+              Container(margin: const EdgeInsets.only(top: 8), decoration: box(), child: ListTile(title: Text(e.text), subtitle: Text(e.date), trailing: Text(e.mood))),
           ]);
         },
       );
@@ -773,7 +758,7 @@ class _ReviewState extends State<ReviewPage> {
 // ── Analytics ──
 class StatsPage extends StatelessWidget {
   const StatsPage({super.key});
-  static const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  static const wd = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
   Widget tile(String a, String b) => Container(
         width: 150, padding: const EdgeInsets.all(14), decoration: box(),
@@ -787,24 +772,29 @@ class StatsPage extends StatelessWidget {
   Widget build(BuildContext context) => ListenableBuilder(
         listenable: store,
         builder: (_, __) {
-          final today = DateTime.now().weekday - 1;
-          final total = store.focusMin.fold<double>(0, (a, b) => a + b).round();
+          final days = [for (var k = 6; k >= 0; k--) DateTime.now().subtract(Duration(days: k))];
+          final mins = [for (final d in days) store.focus[Store.key(d)] ?? 0.0];
+          final peak = max(mins.reduce(max), 30.0);
+          final total = store.focus.values.fold<double>(0, (a, b) => a + b).round();
           final n = store.right + store.wrong;
           return ListView(padding: const EdgeInsets.all(16), children: [
             Container(
               padding: const EdgeInsets.all(16), decoration: box(),
               child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                const Text('Focus minutes per day', style: TextStyle(fontWeight: FontWeight.w600)),
+                const Text('Focus minutes (last 7 days)', style: TextStyle(fontWeight: FontWeight.w600)),
                 SizedBox(
-                  height: 140,
+                  height: 150,
                   child: Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
                     for (var d = 0; d < 7; d++)
                       Expanded(
                         child: Column(mainAxisAlignment: MainAxisAlignment.end, children: [
-                          Text('${store.focusMin[d].round()}', style: const TextStyle(fontSize: 10)),
-                          Container(height: store.focusMin[d].clamp(2, 100).toDouble(), margin: const EdgeInsets.symmetric(horizontal: 6),
-                              decoration: BoxDecoration(color: d == today ? sage : butter, borderRadius: BorderRadius.circular(6))),
-                          Text(days[d], style: const TextStyle(fontSize: 11)),
+                          Text('${mins[d].round()}', style: const TextStyle(fontSize: 10)),
+                          Container(
+                            height: (mins[d] / peak * 100).clamp(2.0, 100.0),
+                            margin: const EdgeInsets.symmetric(horizontal: 6),
+                            decoration: BoxDecoration(color: d == 6 ? sage : butter, borderRadius: BorderRadius.circular(6)),
+                          ),
+                          Text(wd[days[d].weekday - 1], style: const TextStyle(fontSize: 11)),
                         ]),
                       ),
                   ]),
